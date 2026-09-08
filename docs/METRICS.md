@@ -14,6 +14,7 @@ developer, per time window (7/30/90 days on the dashboard).
 | Avg review turnaround | Hours from PR opened → first review | How fast a dev's PRs get looked at (or, for reviewers, how responsive they are) |
 | Testing/QA comments | Comments matching testing-related keywords | Approximates "testing/QA feedback," which you specifically asked to track |
 | Commits / active days | Commit count and distinct days with commits | Baseline activity pulse |
+| Needs attention (PR list, not per-dev) | Open PRs stale ≥7 days, or unreviewed ≥2 days | Surfaces what's actually stuck *right now*, separate from historical metrics — this is the first thing a manager should look at |
 
 ## Deliberately not shown (yet)
 
@@ -29,8 +30,10 @@ number next to the raw metrics — not the headline.
 - Trend charts per developer (this dashboard already logs history in
   `pull_requests`/`commits`, so a sparkline per metric is mostly a UI
   addition)
-- Team-level rollups (open PRs waiting >X days, review-load imbalance)
-- Slack/email digest of the weekly numbers
+- Review-load imbalance (who's reviewing everything vs. nobody)
+- Slack/email digest of the weekly numbers and the Needs Attention list
+- Configurable staleness thresholds per org (currently fixed at 7
+  days / 2 days unreviewed in `getNeedsAttention`)
 - CI pass-rate per PR (the `ci_conclusion` column is already in the
   schema, just needs the sync script to pull check-run status)
 - Filter/segment by `team` (column already exists on `developers`)
