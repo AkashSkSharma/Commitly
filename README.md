@@ -107,3 +107,11 @@ moment they sign in with that email. No redeploy, no SQL needed.
 
 See `docs/METRICS.md` for the full breakdown and the reasoning behind
 each metric, plus a running list of feature ideas to add next.
+
+## Design principles
+
+See `docs/DESIGN.md` before adding a screen or feature — it covers the
+product's visual and UX ground rules (dark/dense by default, when to
+reach for Aceternity vs. plain shadcn, no ranking/scoring framing,
+org-boundary rules for new queries) so the product stays coherent as
+more people build on it.
