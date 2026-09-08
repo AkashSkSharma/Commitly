@@ -1,17 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
 
 /**
- * Triggers the GitHub -> Supabase sync. Called by the Vercel Cron job
- * defined in vercel.json (daily). Protect it with CRON_SECRET so it
- * can't be hit by anyone who finds the URL.
+ * Triggers a GitHub -> Supabase sync for every organization. Called by
+ * the Vercel Cron job defined in vercel.json (daily). Protected by
+ * CRON_SECRET so it can't be hit by anyone who finds the URL.
  *
- * The actual sync logic lives in scripts/sync-github.ts and is
- * duplicated here at a high level rather than imported directly,
- * because Next.js route handlers run in a serverless function with a
- * time limit — for a large org, prefer running the script via a
- * scheduled GitHub Action or a longer-running Vercel Cron with
- * `maxDuration` instead. This route is wired up for smaller orgs where
- * a single run comfortably finishes in time.
+ * The actual sync logic lives in scripts/sync-github.ts and is imported
+ * here rather than duplicated. For a large number of organizations,
+ * prefer fanning this out (one invocation per org, e.g. via a queue)
+ * over one long-running loop — see the `maxDuration` note below.
  */
 export async function GET(request: NextRequest) {
   const authHeader = request.headers.get("authorization");
@@ -19,11 +16,12 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const { main, errorMessage } = await import("../../../../scripts/sync-github");
+  const { runSyncForAllOrgs } = await import("../../../../scripts/sync-github");
   try {
-    const result = await main();
-    return NextResponse.json({ ok: true, ...result });
+    const results = await runSyncForAllOrgs();
+    return NextResponse.json({ ok: true, results });
   } catch (err: unknown) {
+    const { errorMessage } = await import("../../../../scripts/sync-github");
     return NextResponse.json(
       { ok: false, error: errorMessage(err) },
       { status: 500 }
@@ -31,4 +29,4 @@ export async function GET(request: NextRequest) {
   }
 }
 
-export const maxDuration = 300; // seconds — bump on Pro/Enterprise if needed
+export const maxDuration = 300; // seconds — bump on Pro/Enterprise, or fan out per-org

@@ -1,5 +1,7 @@
 import Link from "next/link";
-import { getTeamSummary, getLastSyncRun } from "@/lib/metrics";
+import { redirect } from "next/navigation";
+import { getTeamSummary, getLastSyncRun, getNeedsAttention } from "@/lib/metrics";
+import { getCurrentOrg } from "@/lib/org";
 import {
   Table,
   TableBody,
@@ -23,12 +25,16 @@ export default async function DashboardPage({
 }: {
   searchParams: Promise<{ window?: string }>;
 }) {
+  const org = await getCurrentOrg();
+  if (!org) redirect("/onboarding");
+
   const { window } = await searchParams;
   const windowDays = Number(window ?? 30);
 
-  const [team, lastSync] = await Promise.all([
-    getTeamSummary(windowDays),
-    getLastSyncRun(),
+  const [team, lastSync, needsAttention] = await Promise.all([
+    getTeamSummary(org.orgId, windowDays),
+    getLastSyncRun(org.orgId),
+    getNeedsAttention(org.orgId),
   ]);
 
   const sortedTeam = [...team].sort((a, b) => b.prsMerged - a.prsMerged);
@@ -70,6 +76,40 @@ export default async function DashboardPage({
             ? ` — ${lastSync.error}`
             : ""}
         </p>
+      )}
+
+      {needsAttention.length > 0 && (
+        <Card className="border-amber-500/20 bg-amber-500/5">
+          <CardHeader>
+            <CardTitle className="text-base text-amber-200">
+              Needs attention ({needsAttention.length})
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            {needsAttention.slice(0, 8).map((pr) => (
+              <div
+                key={pr.id}
+                className="flex items-center justify-between border-b border-amber-500/10 pb-2 text-sm last:border-0"
+              >
+                <span className="text-neutral-200">
+                  <span className="text-neutral-500">
+                    {pr.repoFullName}#{pr.prNumber}
+                  </span>{" "}
+                  {pr.title}
+                  {pr.authorLogin && (
+                    <span className="text-neutral-500"> · @{pr.authorLogin}</span>
+                  )}
+                </span>
+                <Badge
+                  variant="outline"
+                  className="border-amber-500/40 text-amber-300"
+                >
+                  {pr.hasReview ? `open ${pr.daysOpen}d` : `no review · ${pr.daysOpen}d`}
+                </Badge>
+              </div>
+            ))}
+          </CardContent>
+        </Card>
       )}
 
       <Card className="border-white/10 bg-white/5">
@@ -134,7 +174,9 @@ export default async function DashboardPage({
               {sortedTeam.length === 0 && (
                 <TableRow>
                   <TableCell colSpan={9} className="text-center text-neutral-500">
-                    No activity yet — run the sync script to pull GitHub data.
+                    No activity yet — the first sync runs right after
+                    onboarding; check back in a minute or trigger a manual
+                    sync.
                   </TableCell>
                 </TableRow>
               )}

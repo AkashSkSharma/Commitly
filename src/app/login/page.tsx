@@ -47,8 +47,8 @@ export default function LoginPage() {
         <CardHeader>
           <CardTitle className="text-xl">Commitly</CardTitle>
           <CardDescription className="text-white/60">
-            Sign in with your manager email to get a magic link — no
-            password needed.
+            See your team&apos;s GitHub activity in one place. Enter your
+            email for a magic link — no password needed.
           </CardDescription>
         </CardHeader>
         <CardContent>

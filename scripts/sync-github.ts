@@ -1,34 +1,20 @@
 /**
- * GitHub -> Supabase sync job.
+ * GitHub -> Supabase sync job — org-aware.
  *
- * Pulls all non-ignored repos in GITHUB_ORG, and for each repo, all pull
- * requests (last 90 days by default) with their reviews, review comments,
- * and commits, then upserts everything into Supabase.
+ * `runSync` pulls all non-ignored repos for one organization's connected
+ * GitHub org, and for each repo, all pull requests (last N days) with
+ * their reviews, review comments, and commits, then upserts everything
+ * into Supabase scoped to that organization's org_id.
  *
- * Run manually:   npx tsx scripts/sync-github.ts
- * Run on Vercel:  wire this up as a Vercel Cron Job hitting
- *                 /api/sync (see src/app/api/sync/route.ts), which calls
- *                 the same logic.
+ * Run manually for one org:  npx tsx scripts/sync-github.ts <org-slug>
+ * Run for every org:          npx tsx scripts/sync-github.ts --all
+ * Run on Vercel:               /api/sync loops over all organizations
+ *                              and calls runSync for each (see
+ *                              src/app/api/sync/route.ts).
  */
 import "dotenv/config";
 import { graphql } from "@octokit/graphql";
 import { createAdminClient } from "../src/lib/supabase/admin";
-
-const ORG = process.env.GITHUB_ORG!;
-const TOKEN = process.env.GITHUB_TOKEN!;
-const IGNORED = new Set(
-  (process.env.GITHUB_IGNORED_REPOS ?? "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean)
-);
-// How far back to pull PR activity on each run. Wide enough to catch
-// long-lived PRs, narrow enough to keep each run fast.
-const LOOKBACK_DAYS = Number(process.env.SYNC_LOOKBACK_DAYS ?? 90);
-
-const gh = graphql.defaults({
-  headers: { authorization: `token ${TOKEN}` },
-});
 
 // Simple heuristic for "testing/QA-related" PR comments, per the
 // dashboard's testing-signal metric. Extend this list as real comment
@@ -108,7 +94,7 @@ type GqlPR = {
 };
 
 const REPO_QUERY = /* GraphQL */ `
-  query ($org: String!, $cursor: String, $since: DateTime!) {
+  query ($org: String!, $cursor: String) {
     organization(login: $org) {
       repositories(first: 20, after: $cursor) {
         pageInfo {
@@ -192,20 +178,22 @@ type OrgReposQueryResult = {
   };
 };
 
-async function fetchOrgRepos(): Promise<GqlRepo[]> {
-  const since = new Date(
-    Date.now() - LOOKBACK_DAYS * 24 * 60 * 60 * 1000
-  ).toISOString();
+async function fetchOrgRepos(
+  githubOrg: string,
+  token: string
+): Promise<GqlRepo[]> {
+  const gh = graphql.defaults({
+    headers: { authorization: `token ${token}` },
+  });
 
   const repos: GqlRepo[] = [];
   let cursor: string | null = null;
 
   while (true) {
-    const result = await gh(REPO_QUERY, {
-      org: ORG,
+    const result = (await gh(REPO_QUERY, {
+      org: githubOrg,
       cursor,
-      since,
-    }) as OrgReposQueryResult;
+    })) as OrgReposQueryResult;
     const page = result.organization.repositories;
     repos.push(...page.nodes);
     if (!page.pageInfo.hasNextPage) break;
@@ -215,12 +203,29 @@ async function fetchOrgRepos(): Promise<GqlRepo[]> {
   return repos;
 }
 
-export async function main() {
+export type SyncParams = {
+  orgId: number;
+  githubOrg: string;
+  githubToken: string;
+  ignoredRepos?: string[];
+};
+
+export type SyncResult = { reposSynced: number; prsSynced: number };
+
+/**
+ * Syncs one Commitly organization's GitHub activity into Supabase. This
+ * is the function both the CLI entrypoint below and /api/sync call —
+ * everything it writes is tagged with `orgId` so organizations' data
+ * never mixes.
+ */
+export async function runSync(params: SyncParams): Promise<SyncResult> {
+  const { orgId, githubOrg, githubToken } = params;
+  const ignored = new Set(params.ignoredRepos ?? []);
   const supabase = createAdminClient();
 
   const { data: syncRun } = await supabase
     .from("sync_runs")
-    .insert({ status: "running" })
+    .insert({ status: "running", org_id: orgId })
     .select()
     .single();
 
@@ -228,11 +233,13 @@ export async function main() {
   let prsSynced = 0;
 
   try {
-    console.log(`Fetching repos for org "${ORG}"...`);
-    const repos = await fetchOrgRepos();
-    console.log(`Fetched ${repos.length} repos.`);
+    console.log(`[org ${orgId}] Fetching repos for "${githubOrg}"...`);
+    const repos = await fetchOrgRepos(githubOrg, githubToken);
+    console.log(`[org ${orgId}] Fetched ${repos.length} repos.`);
 
-    // Cache of github_login -> developer row id, populated as we see authors.
+    // Cache of github_login -> developer row id, populated as we see
+    // authors. Scoped per-run (per-org) since the same login can be a
+    // different developer row in a different organization.
     const developerCache = new Map<string, number>();
 
     async function getOrCreateDeveloper(
@@ -244,8 +251,8 @@ export async function main() {
       const { data, error } = await supabase
         .from("developers")
         .upsert(
-          { github_login: login, avatar_url: avatarUrl },
-          { onConflict: "github_login", ignoreDuplicates: false }
+          { org_id: orgId, github_login: login, avatar_url: avatarUrl },
+          { onConflict: "org_id,github_login", ignoreDuplicates: false }
         )
         .select("id")
         .single();
@@ -256,18 +263,19 @@ export async function main() {
     }
 
     for (const repo of repos) {
-      if (IGNORED.has(repo.name)) continue;
+      if (ignored.has(repo.name)) continue;
 
       const { data: repoRow, error: repoError } = await supabase
         .from("repositories")
         .upsert(
           {
+            org_id: orgId,
             github_repo_id: repo.databaseId,
             name: repo.name,
-            full_name: `${ORG}/${repo.name}`,
+            full_name: `${githubOrg}/${repo.name}`,
             is_archived: repo.isArchived,
           },
-          { onConflict: "full_name" }
+          { onConflict: "org_id,full_name" }
         )
         .select("id")
         .single();
@@ -297,9 +305,7 @@ export async function main() {
               github_pr_id: pr.databaseId,
               author_id: authorId,
               title: pr.title,
-              state: pr.mergedAt
-                ? "merged"
-                : pr.state.toLowerCase(),
+              state: pr.mergedAt ? "merged" : pr.state.toLowerCase(),
               additions: pr.additions,
               deletions: pr.deletions,
               changed_files: pr.changedFiles,
@@ -391,12 +397,10 @@ export async function main() {
       })
       .eq("id", syncRun!.id);
 
-    console.log(
-      `Done. ${reposSynced} repos, ${prsSynced} PRs synced.`
-    );
+    console.log(`[org ${orgId}] Done. ${reposSynced} repos, ${prsSynced} PRs synced.`);
     return { reposSynced, prsSynced };
   } catch (err: unknown) {
-    console.error("Sync failed:", err);
+    console.error(`[org ${orgId}] Sync failed:`, err);
     if (syncRun) {
       await supabase
         .from("sync_runs")
@@ -413,8 +417,83 @@ export async function main() {
   }
 }
 
-// Only run immediately when invoked directly (CLI usage). When imported
-// by the API route, `main` is called explicitly instead.
+/** Syncs every organization in Supabase. Used by /api/sync and by the CLI's --all mode. */
+export async function runSyncForAllOrgs(): Promise<
+  { orgId: number; slug: string; result?: SyncResult; error?: string }[]
+> {
+  const supabase = createAdminClient();
+  const { data: orgs, error } = await supabase
+    .from("organizations")
+    .select("id, slug, github_org, github_token");
+
+  if (error || !orgs) throw error ?? new Error("failed to list organizations");
+
+  const results = [];
+  for (const org of orgs) {
+    if (!org.github_token) {
+      results.push({
+        orgId: org.id,
+        slug: org.slug,
+        error: "no GitHub token configured",
+      });
+      continue;
+    }
+    try {
+      const result = await runSync({
+        orgId: org.id,
+        githubOrg: org.github_org,
+        githubToken: org.github_token,
+      });
+      results.push({ orgId: org.id, slug: org.slug, result });
+    } catch (err) {
+      results.push({ orgId: org.id, slug: org.slug, error: errorMessage(err) });
+    }
+  }
+  return results;
+}
+
+// ---------- CLI entrypoint ----------
+// Usage:
+//   npx tsx scripts/sync-github.ts --all        sync every organization
+//   npx tsx scripts/sync-github.ts <org-slug>    sync one organization
+async function cli() {
+  const arg = process.argv[2];
+  if (!arg) {
+    console.error(
+      "Usage: npx tsx scripts/sync-github.ts <org-slug> | --all"
+    );
+    process.exit(1);
+  }
+
+  if (arg === "--all") {
+    const results = await runSyncForAllOrgs();
+    console.table(results.map((r) => ({ ...r, result: undefined, ...r.result })));
+    return;
+  }
+
+  const supabase = createAdminClient();
+  const { data: org, error } = await supabase
+    .from("organizations")
+    .select("id, github_org, github_token")
+    .eq("slug", arg)
+    .maybeSingle();
+
+  if (error || !org) {
+    console.error(`No organization with slug "${arg}"`);
+    process.exit(1);
+  }
+  if (!org.github_token) {
+    console.error(`Organization "${arg}" has no GitHub token configured.`);
+    process.exit(1);
+  }
+
+  await runSync({
+    orgId: org.id,
+    githubOrg: org.github_org,
+    githubToken: org.github_token,
+  });
+}
+
 if (require.main === module) {
-  main().catch(() => process.exit(1));
+  cli().catch(() => process.exit(1));
 }

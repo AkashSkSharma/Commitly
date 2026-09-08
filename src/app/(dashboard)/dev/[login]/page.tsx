@@ -1,5 +1,6 @@
-import { notFound } from "next/navigation";
+import { notFound, redirect } from "next/navigation";
 import { getDeveloperDetail } from "@/lib/metrics";
+import { getCurrentOrg } from "@/lib/org";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { format } from "date-fns";
@@ -9,8 +10,11 @@ export default async function DeveloperDetailPage({
 }: {
   params: Promise<{ login: string }>;
 }) {
+  const org = await getCurrentOrg();
+  if (!org) redirect("/onboarding");
+
   const { login } = await params;
-  const detail = await getDeveloperDetail(login);
+  const detail = await getDeveloperDetail(org.orgId, login);
 
   if (!detail) notFound();
 
