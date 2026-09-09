@@ -47,7 +47,6 @@ type GqlRepo = {
   name: string;
   databaseId: number;
   isArchived: boolean;
-  pullRequests: { nodes: GqlPR[] };
 };
 
 type GqlPR = {
@@ -93,10 +92,15 @@ type GqlPR = {
   };
 };
 
-const REPO_QUERY = /* GraphQL */ `
+// Kept intentionally cheap — just enough to list repos and paginate.
+// PR/review/comment/commit data is fetched per-repo below, in its own
+// query, so cost never multiplies across every repo in the org at once
+// (that multiplication is what triggered GitHub's "Resource limits for
+// this query exceeded" error on orgs with more than a handful of repos).
+const REPO_LIST_QUERY = /* GraphQL */ `
   query ($org: String!, $cursor: String) {
     organization(login: $org) {
-      repositories(first: 20, after: $cursor) {
+      repositories(first: 50, after: $cursor) {
         pageInfo {
           hasNextPage
           endCursor
@@ -105,64 +109,6 @@ const REPO_QUERY = /* GraphQL */ `
           name
           databaseId
           isArchived
-          pullRequests(
-            first: 30
-            orderBy: { field: UPDATED_AT, direction: DESC }
-          ) {
-            nodes {
-              number
-              databaseId
-              title
-              state
-              additions
-              deletions
-              changedFiles
-              createdAt
-              mergedAt
-              closedAt
-              author {
-                login
-                avatarUrl
-              }
-              commits(first: 50) {
-                nodes {
-                  commit {
-                    oid
-                    message
-                    additions
-                    deletions
-                    authoredDate
-                    author {
-                      user {
-                        login
-                      }
-                    }
-                  }
-                }
-              }
-              reviews(first: 30) {
-                nodes {
-                  databaseId
-                  state
-                  submittedAt
-                  body
-                  author {
-                    login
-                  }
-                }
-              }
-              comments(first: 50) {
-                nodes {
-                  databaseId
-                  body
-                  createdAt
-                  author {
-                    login
-                  }
-                }
-              }
-            }
-          }
         }
       }
     }
@@ -190,7 +136,7 @@ async function fetchOrgRepos(
   let cursor: string | null = null;
 
   while (true) {
-    const result = (await gh(REPO_QUERY, {
+    const result = (await gh(REPO_LIST_QUERY, {
       org: githubOrg,
       cursor,
     })) as OrgReposQueryResult;
@@ -201,6 +147,121 @@ async function fetchOrgRepos(
   }
 
   return repos;
+}
+
+// One repo's worth of PRs (with nested reviews/comments/commits) per
+// request. Page size and nested limits are kept modest for the same
+// reason as above. We only pull the most recent couple of pages of
+// PRs per repo — plenty for the 7/30/90-day dashboard windows without
+// re-fetching a repo's entire history every sync.
+const REPO_PRS_QUERY = /* GraphQL */ `
+  query ($owner: String!, $repo: String!, $cursor: String) {
+    repository(owner: $owner, name: $repo) {
+      pullRequests(
+        first: 20
+        after: $cursor
+        orderBy: { field: UPDATED_AT, direction: DESC }
+      ) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          number
+          databaseId
+          title
+          state
+          additions
+          deletions
+          changedFiles
+          createdAt
+          mergedAt
+          closedAt
+          author {
+            login
+            avatarUrl
+          }
+          commits(first: 20) {
+            nodes {
+              commit {
+                oid
+                message
+                additions
+                deletions
+                authoredDate
+                author {
+                  user {
+                    login
+                  }
+                }
+              }
+            }
+          }
+          reviews(first: 20) {
+            nodes {
+              databaseId
+              state
+              submittedAt
+              body
+              author {
+                login
+              }
+            }
+          }
+          comments(first: 20) {
+            nodes {
+              databaseId
+              body
+              createdAt
+              author {
+                login
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+`;
+
+type RepoPrsQueryResult = {
+  repository: {
+    pullRequests: {
+      pageInfo: { hasNextPage: boolean; endCursor: string | null };
+      nodes: GqlPR[];
+    };
+  };
+};
+
+// Cap how many pages of PRs we pull per repo per sync, so one huge repo
+// can't make the whole run take forever (or reintroduce the same
+// resource-limit problem via too many sequential requests). 3 pages of
+// 20 = 60 most-recently-updated PRs per repo, refreshed every run.
+const MAX_PR_PAGES_PER_REPO = 3;
+
+async function fetchRepoPRs(
+  gh: ReturnType<typeof graphql.defaults>,
+  githubOrg: string,
+  repoName: string
+): Promise<GqlPR[]> {
+  const prs: GqlPR[] = [];
+  let cursor: string | null = null;
+  let pages = 0;
+
+  while (pages < MAX_PR_PAGES_PER_REPO) {
+    const result = (await gh(REPO_PRS_QUERY, {
+      owner: githubOrg,
+      repo: repoName,
+      cursor,
+    })) as RepoPrsQueryResult;
+    const page = result.repository.pullRequests;
+    prs.push(...page.nodes);
+    pages++;
+    if (!page.pageInfo.hasNextPage) break;
+    cursor = page.pageInfo.endCursor;
+  }
+
+  return prs;
 }
 
 export type SyncParams = {
@@ -231,6 +292,10 @@ export async function runSync(params: SyncParams): Promise<SyncResult> {
 
   let reposSynced = 0;
   let prsSynced = 0;
+
+  const gh = graphql.defaults({
+    headers: { authorization: `token ${githubToken}` },
+  });
 
   try {
     console.log(`[org ${orgId}] Fetching repos for "${githubOrg}"...`);
@@ -285,7 +350,20 @@ export async function runSync(params: SyncParams): Promise<SyncResult> {
         continue;
       }
 
-      for (const pr of repo.pullRequests.nodes) {
+      let prs: GqlPR[];
+      try {
+        prs = await fetchRepoPRs(gh, githubOrg, repo.name);
+      } catch (err: unknown) {
+        // One repo failing to fetch (rate limit, resource limits on an
+        // unusually large repo, etc.) shouldn't abort the whole org's
+        // sync — log it and move on to the next repo.
+        console.error(
+          `  ! failed to fetch PRs for ${repo.name}: ${errorMessage(err)}`
+        );
+        continue;
+      }
+
+      for (const pr of prs) {
         const authorId = pr.author
           ? await getOrCreateDeveloper(pr.author.login, pr.author.avatarUrl)
           : null;
@@ -384,7 +462,7 @@ export async function runSync(params: SyncParams): Promise<SyncResult> {
       }
 
       reposSynced++;
-      console.log(`  synced ${repo.name}: ${repo.pullRequests.nodes.length} PRs`);
+      console.log(`  synced ${repo.name}: ${prs.length} PRs`);
     }
 
     await supabase
